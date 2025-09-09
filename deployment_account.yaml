@@ -1,0 +1,665 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: |
+  AWS Identity Center OIDC Application Automation Template
+  
+  This template creates an automated system for provisioning Identity Center OIDC applications:
+  1. DynamoDB table stores application configurations
+  2. Lambda function processes new applications via DynamoDB Streams
+  3. Cross-account role allows Lambda to create SSM parameters in IDC account
+  4. Applications are automatically configured when added to DynamoDB
+  
+  Usage: Add application to DynamoDB ? Lambda auto-creates IDC OIDC configuration
+
+# =============================================================================
+# TEMPLATE PARAMETERS - Customize these values for your environment
+# =============================================================================
+
+Parameters:
+  IDCAccountId:
+    Type: String
+    Default: '123456789012'
+    Description: |
+      AWS Account ID where Identity Center is deployed.
+      Lambda will assume a role in this account to create SSM parameters.
+      Example: 123456789012
+  
+  IdentityCenterDomain:
+    Type: String
+    Default: 'd-1234567890.awsapps.com'
+    Description: |
+      Your Identity Center domain name (without https://).
+      Find this in AWS SSO console under Settings.
+      Example: d-1234567890.awsapps.com
+  
+  DefaultCallbackURL:
+    Type: String
+    Default: 'https://myapp.example.com/callback'
+    Description: |
+      Default callback URL used when applications don't specify one.
+      This is where users are redirected after successful authentication.
+      Example: https://myapp.example.com/callback
+
+  DefaultGroups:
+    Type: CommaDelimitedList
+    Default: 'AdminGroup,UserGroup'
+    Description: |
+      Default groups assigned to applications when no groups are specified.
+      Users must be in these groups to access the OIDC application.
+      Comma-separated list. Example: AdminGroup,UserGroup,DeveloperGroup
+
+  ApplicationDeployAccountId:
+    Type: String
+    Default: ''
+    Description: |
+      AWS Account ID where this Lambda application is deployed - used for auditing.
+      Tracks which account deployed each OIDC application for multi-account governance.
+      Leave empty to use current deployment account ID automatically - no manual input required.
+
+# =============================================================================
+# CONDITIONS - Logic for parameter handling
+# =============================================================================
+
+Conditions:
+  UseCurrentAccount: !Equals [!Ref ApplicationDeployAccountId, '']
+
+# =============================================================================
+# AWS RESOURCES - Core infrastructure for OIDC application automation
+# =============================================================================
+
+Resources:
+  # =============================================================================
+  # DYNAMODB TABLE - Stores application configurations and triggers processing
+  # =============================================================================
+  # This table acts as the "input" for new applications. When you add an item
+  # to this table, it triggers the Lambda function to create the OIDC application.
+  IDCApplicationTriggerTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: idc-application-triggers
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: application_name
+          AttributeType: S
+        - AttributeName: status
+          AttributeType: S
+      KeySchema:
+        - AttributeName: application_name
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: status-index
+          KeySchema:
+            - AttributeName: status
+              KeyType: HASH
+          Projection:
+            ProjectionType: ALL
+      StreamSpecification:
+        StreamViewType: NEW_AND_OLD_IMAGES
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+
+  # =============================================================================
+  # CLOUDWATCH LOGS - Stores Lambda execution logs for debugging
+  # =============================================================================
+  # This log group captures all Lambda function output for troubleshooting
+  # and monitoring the application creation process.
+  IDCLambdaLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${IDCApplicationTriggerFunction}'
+      RetentionInDays: 14
+      KmsKeyId: !Ref AWS::NoValue
+
+  # =============================================================================
+  # IAM ROLE - Permissions for Lambda to access DynamoDB and assume cross-account role
+  # =============================================================================
+  # This role allows the Lambda function to:
+  # 1. Read/write to DynamoDB table
+  # 2. Assume role in Identity Center account
+  # 3. Write to CloudWatch Logs
+  IDCCrossAccountParameterRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: CrossAccountSSMAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sts:AssumeRole
+                Resource: !Sub 'arn:aws:iam::${IDCAccountId}:role/IDCSSMCrossAccountRole'
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                Resource: !GetAtt IDCApplicationTriggerTable.Arn
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                  - logs:DescribeLogGroups
+                  - logs:DescribeLogStreams
+                Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/*'
+              - Effect: Allow
+                Action:
+                  - dynamodb:DescribeStream
+                  - dynamodb:GetRecords
+                  - dynamodb:GetShardIterator
+                  - dynamodb:ListStreams
+                Resource: !GetAtt IDCApplicationTriggerTable.StreamArn
+
+  # =============================================================================
+  # LAMBDA FUNCTION - Core automation logic for OIDC application creation
+  # =============================================================================
+  # This function:
+  # 1. Receives DynamoDB Stream events when applications are added
+  # 2. Extracts application configuration
+  # 3. Assumes cross-account role in IDC account
+  # 4. Creates SSM parameter with application configuration
+  # 5. Updates DynamoDB status to 'deployed'
+  IDCApplicationTriggerFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: idc-application-trigger
+      Runtime: python3.11
+      Handler: index.lambda_handler
+      Role: !GetAtt IDCCrossAccountParameterRole.Arn
+      Environment:
+        Variables:
+          IDC_ACCOUNT_ID: !Ref IDCAccountId
+          CROSS_ACCOUNT_ROLE: !Sub 'arn:aws:iam::${IDCAccountId}:role/IDCSSMCrossAccountRole'
+          IDC_DOMAIN: !Ref IdentityCenterDomain
+          TRIGGER_TABLE: !Ref IDCApplicationTriggerTable
+          DEFAULT_CALLBACK_URL: !Ref DefaultCallbackURL
+          DEFAULT_GROUPS: !Join [',', !Ref DefaultGroups]
+          APPLICATION_DEPLOY_ACCOUNT_ID: !If [UseCurrentAccount, !Ref 'AWS::AccountId', !Ref ApplicationDeployAccountId]
+      Code:
+        ZipFile: |
+          # =============================================================================
+          # AWS Identity Center OIDC Application Automation Lambda Function
+          # =============================================================================
+          # Purpose: Automatically creates IDC OIDC applications when items are added to DynamoDB
+          # Trigger: DynamoDB Streams (when new applications are added or modified)
+          # Output: SSM Parameters in cross-account for application configuration
+          # =============================================================================
+          
+          import json
+          import boto3
+          import logging
+          import time
+          import os
+          import traceback
+          from datetime import datetime
+          
+          # Configure comprehensive logging for debugging and monitoring
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+          
+          # =============================================================================
+          # CONFIGURATION CONSTANTS
+          # =============================================================================
+          
+          # Default groups assigned to applications if none specified
+          # These groups control who can access the OIDC application in Identity Center
+          # Example: If no groups provided, users in 'ITAWS1' and 'SecurityAWS1' get access
+          DEFAULT_GROUPS = os.environ.get('DEFAULT_GROUPS', 'ITAWS1,SecurityAWS1').split(',')
+          
+          # Standard Identity Center OIDC endpoint paths
+          # These are appended to the IDC domain to create full URLs
+          IDC_ENDPOINTS = {
+              'authorization': '/start/oauth2/authorize',  # Where users go to login
+              'token': '/start/oauth2/token',              # Where apps exchange codes for tokens
+              'userinfo': '/start/oauth2/userinfo',        # Where apps get user information
+              'jwks': '/start/oauth2/jwks'                 # Where apps get public keys for token validation
+          }
+          
+          # =============================================================================
+          # MAIN LAMBDA HANDLER FUNCTION
+          # =============================================================================
+          
+          def lambda_handler(event, context):
+              """
+              Main Lambda function that processes DynamoDB Stream events.
+              
+              Flow:
+              1. Receives DynamoDB Stream event when application is added/modified
+              2. Extracts application configuration from DynamoDB item
+              3. Assumes cross-account role in Identity Center account
+              4. Creates SSM parameter with application configuration
+              5. Updates DynamoDB status to 'deployed'
+              
+              Args:
+                  event: DynamoDB Stream event containing record changes
+                  context: Lambda runtime context with execution details
+              """
+              
+              # Log Lambda invocation details for debugging
+              logger.info(f"=== IDC OIDC Lambda Invocation Started ===")
+              logger.info(f"Request ID: {context.aws_request_id}")
+              logger.info(f"Function Name: {context.function_name}")
+              logger.info(f"Memory Limit: {context.memory_limit_in_mb}MB")
+              logger.info(f"Remaining Time: {context.get_remaining_time_in_millis()}ms")
+              
+              try:
+                  # Create DynamoDB client (reused for better performance)
+                  dynamodb = boto3.client('dynamodb')
+                  
+                  # =============================================================================
+                  # PROCESS DYNAMODB STREAM EVENTS
+                  # =============================================================================
+                  
+                  # Check if this is a DynamoDB Stream event
+                  if 'Records' in event:
+                      logger.info(f"Processing DynamoDB Stream with {len(event['Records'])} records")
+                      
+                      # Process each record in the stream event
+                      for i, record in enumerate(event['Records']):
+                          logger.info(f"--- Processing Record {i+1}/{len(event['Records'])} ---")
+                          logger.info(f"Event Source: {record.get('eventSource')}")
+                          logger.info(f"Event Name: {record.get('eventName')}")
+                          logger.info(f"Event Source ARN: {record.get('eventSourceARN')}")
+                          
+                          # Only process DynamoDB INSERT and MODIFY events
+                          # (Ignore DELETE events as we don't want to recreate deleted apps)
+                          if record['eventSource'] == 'aws:dynamodb' and record['eventName'] in ['INSERT', 'MODIFY']:
+                              
+                              # Extract DynamoDB record details
+                              dynamodb_record = record.get('dynamodb', {})
+                              logger.info(f"DynamoDB Sequence Number: {dynamodb_record.get('SequenceNumber')}")
+                              logger.info(f"DynamoDB Size Bytes: {dynamodb_record.get('SizeBytes')}")
+                              
+                              # Get the new and old item images from the stream
+                              # NewImage: Current state of the item after change
+                              # OldImage: Previous state of the item before change
+                              new_image = dynamodb_record.get('NewImage', {})
+                              old_image = dynamodb_record.get('OldImage', {})
+                              
+                              # =============================================================================
+                              # VALIDATE AND EXTRACT APPLICATION DETAILS
+                              # =============================================================================
+                              
+                              # Validate that application_name exists (required field)
+                              if 'application_name' not in new_image:
+                                  logger.warning("Missing application_name in DynamoDB record")
+                                  continue  # Skip this record and process next one
+                              
+                              # Extract application details from DynamoDB item
+                              app_name = new_image.get('application_name', {}).get('S')
+                              status = new_image.get('status', {}).get('S', 'pending')
+                              old_status = old_image.get('status', {}).get('S', 'none') if old_image else 'none'
+                              
+                              logger.info(f"Application Name: {app_name}")
+                              logger.info(f"Current Status: {status}")
+                              logger.info(f"Previous Status: {old_status}")
+                              logger.info(f"Status Changed: {old_status != status}")
+                              
+                              # =============================================================================
+                              # PROCESS APPLICATION IF NOT ALREADY DEPLOYED
+                              # =============================================================================
+                              
+                              # Only process applications that are not already deployed
+                              # This prevents reprocessing the same application multiple times
+                              if app_name and status != 'deployed':
+                                  logger.info(f"? Processing application: {app_name} (status: {status})")
+                                  
+                                  # Get complete application configuration from DynamoDB
+                                  # We need the full item because stream events may not contain all attributes
+                                  logger.info(f"Fetching full item from DynamoDB table: {os.environ['TRIGGER_TABLE']}")
+                                  start_time = time.time()
+                                  
+                                  response = dynamodb.get_item(
+                                      TableName=os.environ['TRIGGER_TABLE'],
+                                      Key={'application_name': {'S': app_name}}
+                                  )
+                                  
+                                  fetch_time = time.time() - start_time
+                                  logger.info(f"DynamoDB GetItem completed in {fetch_time:.3f}s")
+                                  logger.info(f"Item found: {'Item' in response}")
+                                  
+                                  # =============================================================================
+                                  # BUILD APPLICATION CONFIGURATION
+                                  # =============================================================================
+                                  
+                                  if 'Item' in response:
+                                      item = response['Item']
+                                      logger.info(f"Retrieved item with {len(item)} attributes")
+                                      logger.info(f"Extracting OIDC configuration for {app_name}")
+                                      
+                                      # Build comprehensive application configuration
+                                      # This configuration will be stored in SSM for the target application
+                                      
+                                      # Extract IDC OIDC configuration from DynamoDB
+                                      idc_domain = os.environ['IDC_DOMAIN']
+                                      config = {
+                                          "application": {
+                                              "name": app_name,
+                                              "description": item.get('description', {}).get('S', f'IDC OIDC Application: {app_name}'),
+                                              "callback_url": item.get('callback_url', {}).get('S', os.environ['DEFAULT_CALLBACK_URL']),
+                                              "portal_visibility": item.get('portal_visibility', {}).get('S', 'ENABLED'),
+                                              "assignment_required": item.get('assignment_required', {}).get('BOOL', True)
+                                          },
+                                          "groups": item.get('groups', {}).get('SS', DEFAULT_GROUPS),
+                                          "trusted_identity_propagation": {
+                                              "enabled": item.get('tip_enabled', {}).get('BOOL', True),
+                                              "issuer_name": item.get('issuer_name', {}).get('S', f'{app_name}IDCProvider'),
+                                              "claim_attribute_path": item.get('claim_path', {}).get('S', 'email'),
+                                              "identity_store_attribute_path": item.get('identity_path', {}).get('S', 'emails.value'),
+                                              "jwks_retrieval_option": 'OPEN_ID_DISCOVERY'
+                                          },
+                                          "cross_account": {
+                                              "application_deploy_account_id": os.environ.get('APPLICATION_DEPLOY_ACCOUNT_ID'),
+                                              "region": os.environ.get('AWS_REGION', 'us-east-1'),
+                                              "idc_domain": idc_domain.replace('.awsapps.com', '')
+                                          },
+                                          "status": item.get('environment', {}).get('S', 'production')
+                                      }
+                                      
+                                      logger.info(f"Configuration extracted successfully for {app_name}")
+                                      logger.info(f"Groups assigned: {config['groups']}")
+                                      logger.info(f"Callback URL: {config['application']['callback_url']}")
+                                      
+                                      # Assume role in IDC account
+                                      logger.info(f"Assuming cross-account role in IDC account: {os.environ['IDC_ACCOUNT_ID']}")
+                                      role_arn = os.environ['CROSS_ACCOUNT_ROLE']
+                                      logger.info(f"Role ARN: {role_arn}")
+                                      
+                                      sts = boto3.client('sts')
+                                      assume_start = time.time()
+                                      
+                                      assumed_role = sts.assume_role(
+                                          RoleArn=role_arn,
+                                          RoleSessionName='IDCApplicationCreation',
+                                          ExternalId='idc-sso-integration'
+                                      )
+                                      
+                                      assume_time = time.time() - assume_start
+                                      logger.info(f"Role assumption completed in {assume_time:.3f}s")
+                                      
+                                      # Create SSM client with assumed role credentials
+                                      target_region = os.environ.get('AWS_REGION', 'us-east-1')
+                                      logger.info(f"Creating SSM client for region: {target_region}")
+                                      
+                                      ssm = boto3.client(
+                                          'ssm',
+                                          region_name=target_region,
+                                          aws_access_key_id=assumed_role['Credentials']['AccessKeyId'],
+                                          aws_secret_access_key=assumed_role['Credentials']['SecretAccessKey'],
+                                          aws_session_token=assumed_role['Credentials']['SessionToken']
+                                      )
+                                      
+                                      logger.info(f"SSM client created successfully")
+                                      
+                                      # Store parameter in SSO account
+                                      param_name = f'/sso/{app_name}/config'
+                                      config_json = json.dumps(config, indent=2)
+                                      logger.info(f"Storing parameter: {param_name}")
+                                      logger.info(f"Parameter size: {len(config_json)} bytes")
+                                      
+                                      param_start = time.time()
+                                      
+                                      ssm.put_parameter(
+                                          Name=param_name,
+                                          Value=config_json,
+                                          Type='SecureString',
+                                          Overwrite=True,
+                                          Description=f'Pure IDC OIDC configuration for {app_name}'
+                                      )
+                                      
+                                      param_time = time.time() - param_start
+                                      logger.info(f"Parameter stored successfully in {param_time:.3f}s")
+                                      
+                                      # Update DynamoDB status to 'deployed'
+                                      logger.info(f"Updating DynamoDB status to 'deployed' for {app_name}")
+                                      update_start = time.time()
+                                      
+                                      dynamodb.update_item(
+                                          TableName=os.environ['TRIGGER_TABLE'],
+                                          Key={'application_name': {'S': app_name}},
+                                          UpdateExpression='SET #status = :status, deployed_time = :deployed_time',
+                                          ExpressionAttributeNames={'#status': 'status'},
+                                          ExpressionAttributeValues={
+                                              ':status': {'S': 'deployed'},
+                                              ':deployed_time': {'S': datetime.utcnow().isoformat()}
+                                          }
+                                      )
+                                      
+                                      update_time = time.time() - update_start
+                                      logger.info(f"Status updated successfully in {update_time:.3f}s")
+                                      logger.info(f"? Application {app_name} configuration deployed successfully")
+                                  else:
+                                      logger.warning(f"? Item not found for application: {app_name}")
+                              else:
+                                  logger.info(f"?? Skipping {app_name} - status: {status} (already deployed or invalid)")
+                          else:
+                              logger.info(f"?? Skipping record - Event: {record.get('eventName')}, Source: {record.get('eventSource')}")
+                  
+                  else:
+                      logger.warning(f"? Unhandled event type: {type(event).__name__}")
+                      return {'statusCode': 400, 'body': 'Unhandled event type'}
+                      
+              except Exception as error:
+                  logger.error(f"? CRITICAL ERROR in Lambda execution")
+                  logger.error(f"Error Type: {type(error).__name__}")
+                  logger.error(f"Error Message: {str(error)}")
+                  logger.error(f"Request ID: {context.aws_request_id}")
+                  logger.error(f"Stack Trace: {traceback.format_exc()}")
+                  
+                  # Update status to failed if possible
+                  try:
+                      if 'app_name' in locals() and app_name:
+                          logger.info(f"Attempting to update status to 'failed' for {app_name}")
+                          dynamodb = boto3.client('dynamodb')
+                          dynamodb.update_item(
+                              TableName=os.environ['TRIGGER_TABLE'],
+                              Key={'application_name': {'S': app_name}},
+                              UpdateExpression='SET #status = :status, error_message = :error, error_time = :error_time',
+                              ExpressionAttributeNames={'#status': 'status'},
+                              ExpressionAttributeValues={
+                                  ':status': {'S': 'failed'},
+                                  ':error': {'S': str(error)[:1000]},
+                                  ':error_time': {'S': datetime.utcnow().isoformat()}
+                              }
+                          )
+                          logger.info(f"Status updated to 'failed' for {app_name}")
+                  except Exception as update_error:
+                      logger.error(f"Failed to update error status: {str(update_error)}")
+                  
+                  raise
+              
+              finally:
+                  logger.info(f"=== Lambda Execution Completed ===")
+                  logger.info(f"Remaining Time: {context.get_remaining_time_in_millis()}ms")
+      Timeout: 300
+
+  # =============================================================================
+  # EVENT SOURCE MAPPING - Connects DynamoDB Streams to Lambda function
+  # =============================================================================
+  # This creates the trigger that invokes Lambda when DynamoDB items change.
+  # BatchSize: 1 ensures each application is processed individually.
+  IDCDynamoDBStreamEventSourceMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      EventSourceArn: !GetAtt IDCApplicationTriggerTable.StreamArn
+      FunctionName: !GetAtt IDCApplicationTriggerFunction.Arn
+      StartingPosition: LATEST
+      BatchSize: 1
+
+
+
+Outputs:
+  IDCApplicationTriggerTable:
+    Description: DynamoDB table for triggering application creation
+    Value: !Ref IDCApplicationTriggerTable
+    Export:
+      Name: !Sub '${AWS::StackName}-IDCTriggerTable'
+  
+  LambdaFunction:
+    Description: Lambda function for cross-account application creation
+    Value: !Ref IDCApplicationTriggerFunction
+    Export:
+      Name: !Sub '${AWS::StackName}-LambdaFunction'
+  
+  IdentityCenterDomain:
+    Description: Identity Center Domain
+    Value: !Ref IdentityCenterDomain
+    Export:
+      Name: !Sub '${AWS::StackName}-IDCDomain'
+  
+  IDCOIDCEndpoints:
+    Description: Identity Center OIDC Configuration Endpoints
+    Value: !Sub |
+      Issuer: https://${IdentityCenterDomain}
+      Authorization: https://${IdentityCenterDomain}/start/oauth2/authorize
+      Token: https://${IdentityCenterDomain}/start/oauth2/token
+      UserInfo: https://${IdentityCenterDomain}/start/oauth2/userinfo
+      JWKS: https://${IdentityCenterDomain}/.well-known/jwks.json
+      
+  CrossAccountParameterName:
+    Description: Parameter naming pattern in SSO account
+    Value: '/sso/{application_name}/config'
+
+  CLICommandTemplate:
+    Description: CLI command template for manual application creation
+    Value: !Sub |
+      # Replace <APP_NAME> with your application name
+      aws dynamodb put-item --table-name ${IDCApplicationTriggerTable} --item '{
+        "application_name": {"S": "<APP_NAME>"},
+        "status": {"S": "pending"},
+        "callback_url": {"S": "http://localhost:3000/<APP_NAME>.html"},
+        "issuer": {"S": "https://${IdentityCenterDomain}"},
+        "authorization_endpoint": {"S": "https://${IdentityCenterDomain}/start/oauth2/authorize"},
+        "token_endpoint": {"S": "https://${IdentityCenterDomain}/start/oauth2/token"},
+        "userinfo_endpoint": {"S": "https://${IdentityCenterDomain}/start/oauth2/userinfo"},
+        "jwks_uri": {"S": "https://${IdentityCenterDomain}/.well-known/jwks.json"},
+        "groups": {"SS": ["ITAWS1", "SecurityAWS1"]},
+        "created_time": {"S": "'$(date -u +%Y-%m-%dT%H:%M:%SZ)'"},
+        "ttl": {"N": "'$(($(date +%s) + 86400))'"}
+      }'
+      
+      # Example for multiple applications:
+      # myapp1, myapp2, dashboard, api-gateway, etc.
+
+  CloudShellCommandTemplate:
+    Description: CloudShell command with hardcoded values for testing
+    Value: !Sub |
+      # IMPORTANT: Replace ${IDCApplicationTriggerTable} with your actual DynamoDB table name
+      # Default table name is 'idc-application-triggers' (check CloudFormation outputs for actual name)
+      # CloudShell test command with hardcoded values (remove after testing)
+      aws dynamodb put-item --table-name ${IDCApplicationTriggerTable} --item '{
+        "application_name": {"S": "test-app-123"},
+        "status": {"S": "pending"},
+        "callback_url": {"S": "http://localhost:3000/test-app-123.html"},
+        "issuer": {"S": "https://d-906740ab96.awsapps.com"},
+        "authorization_endpoint": {"S": "https://d-906740ab96.awsapps.com/start/oauth2/authorize"},
+        "token_endpoint": {"S": "https://d-906740ab96.awsapps.com/start/oauth2/token"},
+        "userinfo_endpoint": {"S": "https://d-906740ab96.awsapps.com/start/oauth2/userinfo"},
+        "jwks_uri": {"S": "https://d-906740ab96.awsapps.com/.well-known/jwks.json"},
+        "groups": {"SS": ["ITAWS1", "SecurityAWS1"]},
+        "created_time": {"S": "2024-01-15T16:30:00Z"},
+        "ttl": {"N": "1737049800"}
+      }'
+      
+      # Alternative test with different app name
+      # IMPORTANT: Replace ${IDCApplicationTriggerTable} with your actual DynamoDB table name
+      aws dynamodb put-item --table-name ${IDCApplicationTriggerTable} --item '{
+        "application_name": {"S": "dashboard-app"},
+        "status": {"S": "pending"},
+        "callback_url": {"S": "http://localhost:3000/dashboard.html"},
+        "issuer": {"S": "https://d-906740ab96.awsapps.com"},
+        "authorization_endpoint": {"S": "https://d-906740ab96.awsapps.com/start/oauth2/authorize"},
+        "token_endpoint": {"S": "https://d-906740ab96.awsapps.com/start/oauth2/token"},
+        "userinfo_endpoint": {"S": "https://d-906740ab96.awsapps.com/start/oauth2/userinfo"},
+        "jwks_uri": {"S": "https://d-906740ab96.awsapps.com/.well-known/jwks.json"},
+        "groups": {"SS": ["ITAWS1", "DevAWS1"]},
+        "created_time": {"S": "2024-01-15T16:31:00Z"},
+        "ttl": {"N": "1737049860"}
+      }'
+      
+      # Third test app
+      # IMPORTANT: Replace ${IDCApplicationTriggerTable} with your actual DynamoDB table name
+      aws dynamodb put-item --table-name ${IDCApplicationTriggerTable} --item '{
+        "application_name": {"S": "api-gateway"},
+        "status": {"S": "pending"},
+        "callback_url": {"S": "http://localhost:3000/api-gateway.html"},
+        "issuer": {"S": "https://d-906740ab96.awsapps.com"},
+        "authorization_endpoint": {"S": "https://d-906740ab96.awsapps.com/start/oauth2/authorize"},
+        "token_endpoint": {"S": "https://d-906740ab96.awsapps.com/start/oauth2/token"},
+        "userinfo_endpoint": {"S": "https://d-906740ab96.awsapps.com/start/oauth2/userinfo"},
+        "jwks_uri": {"S": "https://d-906740ab96.awsapps.com/.well-known/jwks.json"},
+        "groups": {"SS": ["ITAWS1", "SecurityAWS1", "DevAWS1"]},
+        "created_time": {"S": "2024-01-15T16:32:00Z"},
+        "ttl": {"N": "1737049920"}
+      }'
+      
+      # Check items were created
+      # IMPORTANT: Replace ${IDCApplicationTriggerTable} with your actual DynamoDB table name
+      aws dynamodb get-item --table-name ${IDCApplicationTriggerTable} --key '{"application_name":{"S":"test-app-123"}}'
+      aws dynamodb get-item --table-name ${IDCApplicationTriggerTable} --key '{"application_name":{"S":"dashboard-app"}}'
+      aws dynamodb get-item --table-name ${IDCApplicationTriggerTable} --key '{"application_name":{"S":"api-gateway"}}'
+      
+      # Watch logs for processing
+      aws logs tail /aws/lambda/${IDCApplicationTriggerFunction} --follow
+      
+  DynamoDBSchema:
+    Description: DynamoDB table schema for application configuration
+    Value: |
+      Required fields:
+      - application_name (S): Primary key
+      - status (S): pending/deployed
+      - callback_url (S): Application callback URL
+      - issuer (S): Identity Center issuer URL
+      - authorization_endpoint (S): OAuth2 authorization endpoint
+      - token_endpoint (S): OAuth2 token endpoint
+      - userinfo_endpoint (S): OAuth2 userinfo endpoint
+      - jwks_uri (S): JWKS URI
+      - groups (SS): String set of required groups
+      
+  IDCCloudWatchLogGroup:
+    Description: CloudWatch Log Group for Lambda function
+    Value: !Ref IDCLambdaLogGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-IDCLogGroup'
+  
+  CloudWatchLogsURL:
+    Description: Direct link to CloudWatch Logs
+    Value: !Sub 'https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#logsV2:log-groups/log-group/$252Faws$252Flambda$252F${IDCApplicationTriggerFunction}'
+  
+  MonitoringCommands:
+    Description: Commands to monitor the deployment process
+    Value: !Sub |
+      # Watch Lambda logs in real-time
+      aws logs tail /aws/lambda/${IDCApplicationTriggerFunction} --follow
+      
+      # Check DynamoDB items status
+      aws dynamodb scan --table-name ${IDCApplicationTriggerTable} --projection-expression "application_name,#status,deployed_time" --expression-attribute-names '{"#status":"status"}'
+      
+      # Check SSM parameters in SSO account
+      aws ssm get-parameters-by-path --path "/sso/" --recursive --region ${AWS::Region}
+  
+  NextSteps:
+    Description: Next steps for IDC OIDC deployment
+    Value: |
+      1. Ensure cross-account role exists in IDC account: IDCSSMCrossAccountRole
+      2. Deploy this template in identity account
+      3. Use CLI commands to add IDC OIDC applications to DynamoDB
+      4. DynamoDB streams will automatically trigger Lambda processing
+      5. Monitor CloudWatch logs for detailed IDC processing information
+      6. Lambda will process only non-deployed IDC applications
+      7. Status will be updated to 'deployed' after successful parameter creation
+      8. Check IDC parameters created in target account: /sso/{app_name}/config
+      9. Verify IDC OIDC applications are created in Identity Center console
+      10. Test IDC authentication flow with created applications
