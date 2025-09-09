@@ -1,1 +1,1171 @@
+# =============================================================================
+# AWS IDENTITY CENTER (IDC) OIDC APPLICATION AUTOMATION TEMPLATE
+# =============================================================================
+# 
+# PURPOSE:
+# This CloudFormation template automates the creation and management of 
+# AWS Identity Center (IDC) OIDC applications across multiple AWS accounts.
+# 
+# WHAT IT DOES:
+# 1. Creates a Lambda function that manages IDC OIDC applications
+# 2. Sets up EventBridge rules to trigger on SSM parameter changes
+# 3. Creates cross-account IAM roles for secure parameter access
+# 4. Automatically creates IAM OIDC providers and roles for testing
+# 5. Tracks application configurations in DynamoDB
+# 
+# WORKFLOW:
+# 1. Deploy this template in target AWS accounts (where apps will be created)
+# 2. Deploy companion template in Identity Center account
+# 3. Create SSM parameters with OIDC config in Identity Center account
+# 4. EventBridge automatically triggers Lambda to create IDC applications
+# 
+# USE CASES:
+# - Multi-account IDC OIDC application deployment
+# - Automated application provisioning via parameter changes
+# - Cross-account Identity Center integration
+# - OIDC authentication testing with IAM roles
+# =============================================================================
+
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'AWS Identity Center OIDC Application Automation - Target Account Template'
+
+# =============================================================================
+# TEMPLATE PARAMETERS
+# =============================================================================
+# These parameters configure the template for your specific environment
+
+Parameters:
+  # Identity Center instance ARN - get this from IDC console
+  InstanceArn:
+    Type: String
+    Description: |
+      AWS Identity Center Instance ARN.
+      Find this in: AWS Console → Identity Center → Settings → Instance ARN
+    Default: arn:aws:sso:::instance/ssoins-abc123def456789
+  
+  # Account ID where the Identity Center trigger Lambda is deployed
+  IdentityAccountId:
+    Type: String
+    Default: '111111111111'
+    Description: |
+      AWS Application Account ID where the trigger Lambda are deployed.
+      This is typically your central identity/security account.
+  
+  # IAM Role for Identity Center application credentials (requires manual setup)
+  ApplicationCredentialsRoleArn:
+    Type: String
+    Description: |
+      IAM Role ARN for Identity Center application credentials.
+      
+      ⚠️  MANUAL CREATION REQUIRED:
+      This role must be created manually in the IAM console because it requires
+      specific trust relationships with the Identity Center service.
+      
+      Creation Steps:
+      1. Go to IAM Console → Roles → Create Role
+      2. Select 'Custom trust policy' and paste:
+         {
+           "Version": "2012-10-17",
+           "Statement": [{
+             "Effect": "Allow",
+             "Principal": {"Service": "sso.amazonaws.com"},
+             "Action": "sts:AssumeRole"
+           }]
+         }
+      3. Attach policies: ReadOnlyAccess (or custom policies as needed)
+      4. Name: IdentityCenter-OIDC-Application-Role
+      5. Copy the role ARN and update this parameter
+      
+      This role will be used by Identity Center applications for AWS API access. 123456789012 is the IDC Account ID
+    Default: "arn:aws:iam::123456789012:role/IdentityCenter-OIDC-Application-Role"
+  
+
+  # Controls whether applications appear in the Identity Center portal
+  PortalVisibility:
+    Type: String
+    Description: |
+      Controls whether created applications are visible in the Identity Center portal.
+      ENABLED: Users can see and access the application from the portal
+      DISABLED: Application exists but is hidden from portal (API access only)
+    Default: "ENABLED"
+    AllowedValues:
+      - "ENABLED"
+      - "DISABLED"
+
+# =============================================================================
+# AWS RESOURCES
+# =============================================================================
+# These resources create the automation infrastructure
+
+Resources:
+  # =============================================================================
+  # CROSS-ACCOUNT IAM ROLE
+  # =============================================================================
+  # This role allows the Identity Center account to manage SSM parameters
+  # in this target account. It's assumed by the trigger Lambda in the IDC account.
+  IDCSSMCrossAccountRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: IDCSSMCrossAccountRole
+      # Trust policy: Only the Identity Center account can assume this role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${IdentityAccountId}:root'  # Identity Center account
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                'sts:ExternalId': 'idc-sso-integration'  # Security: prevents confused deputy
+      # Permissions: Allow SSM parameter management for OIDC configurations
+      Policies:
+        - PolicyName: SSMParameterAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # Allow management of SSM parameters under /sso/ prefix
+              - Effect: Allow
+                Action:
+                  - ssm:GetParameter      # Read parameter values
+                  - ssm:GetParameters     # Read multiple parameters
+                  - ssm:PutParameter      # Create/update parameters
+                  - ssm:DeleteParameter   # Remove parameters
+                  - ssm:GetParameterHistory  # View parameter history
+                Resource: 'arn:aws:ssm:*:*:parameter/sso/*'  # Only /sso/* parameters
+              # Allow KMS decryption for encrypted parameters
+              - Effect: Allow
+                Action:
+                  - kms:Decrypt           # Decrypt parameter values
+                  - kms:DescribeKey       # Get key metadata
+                Resource: 'arn:aws:kms:*:*:key/*'
+                Condition:
+                  StringEquals:
+                    'kms:ViaService': !Sub 'ssm.${AWS::Region}.amazonaws.com'  # Only via SSM
+      Tags:
+        - Key: Purpose
+          Value: Cross-Account-IDC-SSO-Integration
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # =============================================================================
+  # LAMBDA EXECUTION ROLE
+  # =============================================================================
+  # This role provides the Lambda function with permissions to manage
+  # Identity Center applications, IAM resources, and supporting services.
+  IDCLambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      # Basic Lambda execution permissions (CloudWatch Logs)
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      # Comprehensive permissions for Identity Center and supporting services
+      Policies:
+        - PolicyName: SSOAdminAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # Full Identity Center administration permissions
+              - Effect: Allow
+                Action:
+                  # SSO Admin API - manage applications and assignments
+                  - sso-admin:*                                    # All SSO admin operations
+                  - identitystore:*                               # Identity store operations
+                  # SSO API - application lifecycle management
+                  - sso:CreateApplication                         # Create new applications
+                  - sso:DeleteApplication                         # Remove applications
+                  - sso:UpdateApplication                         # Modify applications
+                  - sso:GetApplication                            # Read application details
+                  - sso:ListApplications                          # List all applications
+                  - sso:DescribeInstance                          # Get instance information
+                  # Application assignment management
+                  - sso:CreateApplicationAssignment              # Assign users/groups
+                  - sso:DeleteApplicationAssignment              # Remove assignments
+                  - sso:ListApplicationAssignments               # List assignments
+                  - sso:PutApplicationAssignmentConfiguration    # Configure assignments
+                  - sso:PutApplicationAuthenticationMethod       # Set auth methods
+                  - sso:PutApplicationGrant                      # Configure grants
+                  # Trusted Token Issuer management (for advanced OIDC scenarios)
+                  - sso:CreateTrustedTokenIssuer                 # Create token issuers
+                  - sso:ListTrustedTokenIssuers                  # List token issuers
+                  - sso:DescribeTrustedTokenIssuer               # Get issuer details
+                  - sso:UpdateTrustedTokenIssuer                 # Modify issuers
+                  - sso:DeleteTrustedTokenIssuer                 # Remove issuers
+                Resource: '*'  # Identity Center requires wildcard permissions
+              # Additional SSO Admin permissions for token issuers
+              - Effect: Allow
+                Action:
+                  - sso-admin:CreateTrustedTokenIssuer           # Create via SSO Admin API
+                  - sso-admin:DescribeTrustedTokenIssuer         # Get details via SSO Admin
+                  - sso-admin:ListTrustedTokenIssuers            # List via SSO Admin
+                  - sso-admin:UpdateTrustedTokenIssuer           # Update via SSO Admin
+                  - sso-admin:DeleteTrustedTokenIssuer           # Delete via SSO Admin
+                Resource: '*'
+              # Scoped SSO permissions for specific resources
+              - Effect: Allow
+                Action:
+                  - sso:CreateTrustedTokenIssuer                 # Create token issuer
+                  - sso:ListTrustedTokenIssuers                  # List token issuers
+                  - sso:DescribeTrustedTokenIssuer               # Get issuer details
+                Resource: 
+                  - 'arn:aws:sso:::instance/<SSO_INSTANCE_ID>'           # SSO instance
+                  - 'arn:aws:sso::*:trustedTokenIssuer/<SSO_INSTANCE_ID>/*'  # Token issuers
+              # Application-specific SSO permissions
+              - Effect: Allow
+                Action:
+                  - sso:CreateApplication                        # Create applications
+                  - sso:DeleteApplication                        # Delete applications
+                  - sso:UpdateApplication                        # Update applications
+                  - sso:GetApplication                           # Read applications
+                  - sso:ListApplications                         # List applications
+                  - sso:DescribeInstance                         # Get instance info
+                  - sso:CreateApplicationAssignment             # Create assignments
+                  - sso:DeleteApplicationAssignment             # Delete assignments
+                  - sso:ListApplicationAssignments              # List assignments
+                  - sso:PutApplicationAssignmentConfiguration   # Configure assignments
+                  - sso:PutApplicationAuthenticationMethod      # Set auth methods
+                  - sso:PutApplicationGrant                     # Configure grants
+                Resource: 
+                  - 'arn:aws:sso::*:application/<SSO_INSTANCE_ID>/*'     # Applications
+                  - 'arn:aws:sso:::instance/<SSO_INSTANCE_ID>'            # SSO instance
+                  - 'arn:aws:sso::aws:applicationProvider/custom'         # Custom provider
+                  - 'arn:aws:sso::aws:applicationProvider/oidc'           # OIDC provider
+              # SSM Parameter Store access for configuration management
+              - Effect: Allow
+                Action:
+                  - ssm:GetParameter      # Read individual parameters
+                  - ssm:GetParameters     # Read multiple parameters
+                  - ssm:PutParameter      # Create/update parameters
+                Resource: 'arn:aws:ssm:*:*:parameter/sso/*'  # Only /sso/* parameters
+              # KMS permissions for encrypted SSM parameters
+              - Effect: Allow
+                Action:
+                  - kms:Decrypt           # Decrypt parameter values
+                Resource: 'arn:aws:kms:*:*:key/*'
+                Condition:
+                  StringEquals:
+                    'kms:ViaService': !Sub 'ssm.${AWS::Region}.amazonaws.com'  # Only via SSM
+              # DynamoDB permissions for application configuration tracking
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem      # Read configuration records
+                  - dynamodb:PutItem      # Create configuration records
+                  - dynamodb:UpdateItem   # Update configuration records
+                  - dynamodb:DeleteItem   # Delete configuration records
+                  - dynamodb:Query        # Query by keys
+                  - dynamodb:Scan         # Scan table
+                Resource: !GetAtt IDCSSOConfigTable.Arn  # Only this table
+              # IAM permissions for creating OIDC providers and roles for testing
+              - Effect: Allow
+                Action:
+                  - iam:CreateOpenIDConnectProvider             # Create OIDC identity providers
+                  - iam:AddClientIDToOpenIDConnectProvider      # Add client IDs to providers
+                  - iam:GetOpenIDConnectProvider                # Read provider details
+                  - iam:CreateRole                              # Create IAM roles
+                  - iam:GetRole                                 # Read role details
+                  - iam:AttachRolePolicy                        # Attach managed policies
+                  - iam:PutRolePolicy                           # Add inline policies
+                  - iam:TagRole                                 # Tag roles
+                  - iam:TagOpenIDConnectProvider                # Tag providers
+                Resource: '*'  # IAM requires wildcard for role/provider creation
+
+  # =============================================================================
+  # LAMBDA FUNCTION
+  # =============================================================================
+  # This Lambda function handles all Identity Center OIDC application operations.
+  # It's triggered by EventBridge when SSM parameters change and can also be
+  # invoked directly for manual operations.
+  IDCSSOOperationsFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: idc-sso-operations-handler
+      Runtime: python3.11
+      Handler: index.lambda_handler
+      Role: !GetAtt IDCLambdaExecutionRole.Arn
+      # Environment variables for Lambda configuration
+      Environment:
+        Variables:
+          LOG_LEVEL: INFO                                           # Logging level
+          INSTANCE_ARN: !Ref InstanceArn                          # IDC instance ARN
+          APPLICATION_CREDENTIALS_ROLE_ARN: !Ref ApplicationCredentialsRoleArn  # App credentials role
+          PORTAL_VISIBILITY: !Ref PortalVisibility                # Portal visibility setting
+      # Inline Lambda code - handles IDC OIDC application lifecycle
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import logging
+          import os
+          import traceback
+          from botocore.exceptions import ClientError, NoCredentialsError, BotoCoreError
+          
+          log_level = os.environ.get('LOG_LEVEL', 'INFO')
+          logger = logging.getLogger()
+          logger.setLevel(getattr(logging, log_level.upper()))
+          
+          # Get instance ARN from environment
+          INSTANCE_ARN = os.environ.get('INSTANCE_ARN')
+          
+          # Initialize SSO Admin client
+          sso_admin = boto3.client('sso-admin')
+          
+          # =============================================================================
+          # TRUSTED TOKEN ISSUER FUNCTION
+          # =============================================================================
+          # NOTE: This function is for ADVANCED use cases only!
+          # 
+          # REMOVE THIS FUNCTION IF:
+          # - Using standard IDC OIDC authentication (portal-based login)
+          # - Basic group-based access control
+          # - Users authenticate directly through Identity Center portal
+          # 
+          # KEEP THIS FUNCTION IF:
+          # - API authentication with IDC tokens
+          # - Cross-account service authentication  
+          # - Custom applications that validate IDC JWT tokens
+          # - Trusted Identity Propagation (TIP) scenarios
+          # 
+          # To remove: Delete this entire function + TIP configuration section below
+          # =============================================================================
+          
+          def create_trusted_token_issuer(params):
+              try:
+                  sso_admin = boto3.client('sso-admin')
+                  ssm = boto3.client('ssm')
+                  
+                  instance_arn = params.get('instance_arn') or os.environ.get('INSTANCE_ARN')
+                  if not instance_arn:
+                      raise ValueError("Instance ARN not found")
+                  
+                  issuer_name = params.get('issuer_name', 'DefaultOIDCProvider')
+                  issuer_url = params.get('issuer_url')
+                  
+                  if not issuer_url:
+                      raise ValueError("Missing required parameter: issuer_url")
+                  
+                  logger.info(f"Creating Trusted Token Issuer: {issuer_name}")
+                  
+                  # Check if issuer already exists
+                  try:
+                      existing_issuers = sso_admin.list_trusted_token_issuers(InstanceArn=instance_arn)
+                      for issuer in existing_issuers.get('TrustedTokenIssuers', []):
+                          if issuer['Name'] == issuer_name:
+                              logger.info(f"Trusted Token Issuer already exists: {issuer['TrustedTokenIssuerArn']}")
+                              return {'statusCode': 200, 'body': json.dumps({
+                                  'trusted_token_issuer_arn': issuer['TrustedTokenIssuerArn'],
+                                  'action': 'existing',
+                                  'success': True
+                              })}
+                  except Exception as e:
+                      logger.warning(f"Could not check existing issuers: {str(e)}")
+                  
+                  # Create new Trusted Token Issuer
+                  response = sso_admin.create_trusted_token_issuer(
+                      InstanceArn=instance_arn,
+                      Name=issuer_name,
+                      TrustedTokenIssuerType='OIDC_JWT',
+                      TrustedTokenIssuerConfiguration={
+                          'OidcJwtConfiguration': {
+                              'IssuerUrl': issuer_url,
+                              'ClaimAttributePath': params.get('claim_attribute_path', 'email'),
+                              'IdentityStoreAttributePath': params.get('identity_store_attribute_path', 'emails.value'),
+                              'JwksRetrievalOption': params.get('jwks_retrieval_option', 'OPEN_ID_DISCOVERY')
+                          }
+                      }
+                  )
+                  
+                  issuer_arn = response['TrustedTokenIssuerArn']
+                  logger.info(f"Trusted Token Issuer created: {issuer_arn}")
+                  
+                  # Store the issuer ARN in Parameter Store for future use
+                  try:
+                      ssm.put_parameter(
+                          Name=f'/sso/trusted-token-issuers/{issuer_name}',
+                          Value=issuer_arn,
+                          Type='String',
+                          Overwrite=True
+                      )
+                      logger.info(f"Stored issuer ARN in Parameter Store")
+                  except Exception as e:
+                      logger.warning(f"Failed to store issuer ARN: {str(e)}")
+                  
+                  return {'statusCode': 200, 'body': json.dumps({
+                      'trusted_token_issuer_arn': issuer_arn,
+                      'action': 'created',
+                      'success': True
+                  })}
+              except Exception as error:
+                  logger.error(f"Failed to create Trusted Token Issuer: {str(error)}")
+                  raise
+          
+          def create_oidc_iam_role(oidc_config, app_type):
+              """Create IAM role and OIDC provider for IDC OIDC authentication testing"""
+              iam = boto3.client('iam')
+              
+              client_id = oidc_config.get('ClientId')
+              issuer_url = oidc_config.get('Issuer')
+              user_pool_id = issuer_url.split('/')[-1] if issuer_url else 'unknown'
+              
+              # Create OIDC Identity Provider for IDC (if not exists)
+              # Extract IDC domain from issuer URL
+              idc_domain = issuer_url.replace('https://', '').replace('/start', '') if issuer_url else 'unknown'
+              provider_url = f"https://{idc_domain}/start"
+              sts = boto3.client('sts')
+              context_account = sts.get_caller_identity()['Account']
+              provider_arn = f"arn:aws:iam::{context_account}:oidc-provider/{idc_domain}"
+              
+              try:
+                  iam.create_open_id_connect_provider(
+                      Url=provider_url,
+                      ClientIDList=[client_id],
+                      ThumbprintList=['9e99a48a9960b14926bb7f3b02e22da2b0ab7280'],
+                      Tags=[
+                          {'Key': 'Purpose', 'Value': 'IDC-OIDC-Integration'},
+                          {'Key': 'AppType', 'Value': app_type}
+                      ]
+                  )
+                  logger.info(f"Created OIDC provider: {provider_arn}")
+              except iam.exceptions.EntityAlreadyExistsException:
+                  logger.info(f"OIDC provider already exists: {provider_arn}")
+                  # Update client ID list
+                  try:
+                      iam.add_client_id_to_open_id_connect_provider(
+                          OpenIDConnectProviderArn=provider_arn,
+                          ClientID=client_id
+                      )
+                  except Exception as e:
+                      logger.warning(f"Failed to add client ID to provider: {str(e)}")
+              
+              # Create IAM Role for IDC OIDC
+              role_name = f"IDCOIDC-{app_type.replace('/', '-')}-Role"
+              role_arn = f"arn:aws:iam::{context_account}:role/{role_name}"
+              
+              trust_policy = {
+                  "Version": "2012-10-17",
+                  "Statement": [{
+                      "Effect": "Allow",
+                      "Principal": {"Federated": provider_arn},
+                      "Action": "sts:AssumeRoleWithWebIdentity",
+                      "Condition": {
+                          "StringEquals": {
+                              f"{idc_domain}:aud": client_id
+                          }
+                      }
+                  }]
+              }
+              
+              try:
+                  iam.create_role(
+                      RoleName=role_name,
+                      AssumeRolePolicyDocument=json.dumps(trust_policy),
+                      Description=f'OIDC role for {app_type} application testing',
+                      Tags=[
+                          {'Key': 'Purpose', 'Value': 'IDC-OIDC-Testing'},
+                          {'Key': 'AppType', 'Value': app_type}
+                      ]
+                  )
+                  
+                  # Attach basic policies
+                  iam.attach_role_policy(
+                      RoleName=role_name,
+                      PolicyArn='arn:aws:iam::aws:policy/ReadOnlyAccess'
+                  )
+                  
+                  # Add inline policy for basic testing
+                  iam.put_role_policy(
+                      RoleName=role_name,
+                      PolicyName='IDCOIDCBasicAccess',
+                      PolicyDocument=json.dumps({
+                          "Version": "2012-10-17",
+                          "Statement": [
+                              {
+                                  "Effect": "Allow",
+                                  "Action": [
+                                      "sts:GetCallerIdentity",
+                                      "sts:DecodeAuthorizationMessage"
+                                  ],
+                                  "Resource": "*"
+                              },
+                              {
+                                  "Effect": "Allow",
+                                  "Action": [
+                                      "s3:ListBucket",
+                                      "s3:GetObject"
+                                  ],
+                                  "Resource": "*"
+                              }
+                          ]
+                      })
+                  )
+                  
+                  logger.info(f"Created IAM role: {role_arn}")
+                  
+              except iam.exceptions.EntityAlreadyExistsException:
+                  logger.info(f"IAM role already exists: {role_arn}")
+              
+              return role_arn
+          
+          def lambda_handler(event, context):
+              try:
+                  operation = event.get('operation')
+                  parameters = event.get('parameters', {})
+                  
+                  logger.info(f"Processing operation: {operation}")
+                  
+                  if operation == 'create_application':
+                      return create_sso_application(parameters)
+                  elif operation == 'manage_application':
+                      return manage_sso_application(parameters)
+                  elif operation == 'assign_users':
+                      return assign_users_to_application(parameters)
+                  elif operation == 'configure_oidc':
+                      return configure_oidc_settings(parameters)
+                  elif operation == 'create_trusted_token_issuer':
+                      # NOTE: Remove this operation if not using API authentication with IDC tokens
+                      return create_trusted_token_issuer(parameters)
+                  else:
+                      raise ValueError(f"Unsupported operation: {operation}")
+                      
+              except ValueError as error:
+                  logger.error(f"Invalid operation: {str(error)}")
+                  return {'statusCode': 400, 'body': json.dumps({'error': str(error), 'success': False})}
+              except (NoCredentialsError, BotoCoreError) as error:
+                  logger.error(f"AWS service error: {str(error)}")
+                  return {'statusCode': 503, 'body': json.dumps({'error': 'Service unavailable', 'success': False})}
+              except ClientError as error:
+                  logger.error(f"AWS client error: {error.response['Error']['Code']} - {error.response['Error']['Message']}")
+                  return {'statusCode': 400, 'body': json.dumps({'error': error.response['Error']['Message'], 'success': False})}
+              except Exception as error:
+                  logger.error(f"Unexpected error: {str(error)}")
+                  logger.error(traceback.format_exc())
+                  return {'statusCode': 500, 'body': json.dumps({'error': 'Internal server error', 'success': False})}
+          
+          def create_sso_application(params):
+              try:
+                  sso_admin = boto3.client('sso-admin')
+                  ssm = boto3.client('ssm')
+                  app_name = params.get('application_name')
+                  app_type = params.get('app_type', 'oidcapp')
+                  
+                  logger.info(f"Creating application: {app_name}")
+                  
+                  try:
+                      config_param = ssm.get_parameter(Name=f'/sso/{app_type}/config')
+                      config = json.loads(config_param['Parameter']['Value'])
+                      provider_arn = config.get('provider_arn', 'arn:aws:sso::aws:applicationProvider/oidc')
+                  except ssm.exceptions.ParameterNotFound:
+                      provider_arn = 'arn:aws:sso::aws:applicationProvider/oidc'
+                  
+                  response = sso_admin.create_application(
+                      InstanceArn=params['instance_arn'],
+                      Name=app_name,
+                      Description=params.get('description', ''),
+                      ApplicationProviderArn=provider_arn
+                  )
+                  
+                  params['application_arn'] = response['ApplicationArn']
+                  params['application_name'] = app_name
+                  params['app_type'] = app_type
+                  configure_oidc_settings(params)
+                  
+                  logger.info(f"Application created successfully: {response['ApplicationArn']}")
+                  return {'statusCode': 200, 'body': json.dumps({'application_arn': response['ApplicationArn'], 'success': True})}
+              except KeyError as error:
+                  raise ValueError(f"Missing required parameter: {str(error)}")
+              except ClientError as error:
+                  if error.response['Error']['Code'] == 'ConflictException':
+                      logger.warning(f"Application already exists: {params.get('application_name')}")
+                      raise ValueError(f"Application {params.get('application_name')} already exists")
+                  raise
+          
+          def manage_sso_application(params):
+              try:
+                  # Input validation
+                  if not params:
+                      raise ValueError("Parameters cannot be empty")
+                  
+                  # Handle parameter name from EventBridge
+                  param_name = params.get('parameter_name')
+                  app_name = params.get('application_name')
+                  
+                  if param_name and param_name.startswith('/sso/'):
+                      # Extract app name from parameter path: /sso/{app_name}/config
+                      parts = param_name.strip('/').split('/')
+                      if len(parts) >= 3 and parts[0] == 'sso' and parts[2] == 'config':
+                          app_name = parts[1]
+                          logger.info(f"Extracted app name from parameter: {app_name}")
+                  
+                  if not app_name:
+                      raise ValueError("Missing required parameter: application_name or parameter_name")
+                  
+                  sso_admin = boto3.client('sso-admin')
+                  ssm = boto3.client('ssm')
+                  
+                  logger.info(f"Managing IDC OIDC application: {app_name}")
+                  logger.info(f"Provider type: Identity Center OIDC")
+                  
+                  if 'instance_arn' not in params:
+                      instance_arn = os.environ.get('INSTANCE_ARN')
+                      if instance_arn:
+                          params['instance_arn'] = instance_arn
+                          logger.info(f"Using instance ARN from environment: {instance_arn}")
+                      else:
+                          raise ValueError("Instance ARN not found in environment variables")
+                  
+                  # Get IDC OIDC configuration from SSM parameter
+                  try:
+                      config_param = ssm.get_parameter(Name=f'/sso/{app_name}/config', WithDecryption=True)
+                      param_value = config_param['Parameter']['Value'].strip()
+                      
+                      if not param_value:
+                          logger.warning(f"Parameter /sso/{app_name}/config is empty")
+                          config = {}
+                      else:
+                          config = json.loads(param_value)
+                          logger.info(f"Successfully loaded IDC OIDC config for {app_name}")
+                          logger.info(f"OIDC Issuer: {config.get('oidc', {}).get('Issuer')}")
+                          logger.info(f"Application callback URL: {config.get('application', {}).get('callback_url')}")
+                          logger.info(f"Groups: {config.get('groups', [])}")
+                  except ssm.exceptions.ParameterNotFound:
+                      logger.error(f"IDC OIDC configuration not found: /sso/{app_name}/config")
+                      raise ValueError(f"IDC OIDC configuration parameter /sso/{app_name}/config not found")
+                  except json.JSONDecodeError as e:
+                      logger.error(f"Invalid JSON in IDC OIDC parameter /sso/{app_name}/config: {str(e)}")
+                      raise ValueError(f"Invalid JSON configuration for {app_name}: {str(e)}")
+                  
+                  # Extract configuration from IDC OIDC JSON
+                  oidc_config = config.get('oidc', {})
+                  app_config = config.get('application', {})
+                  groups = config.get('groups', [])
+                  
+                  # Use custom provider for IDC OIDC applications
+                  provider_arn = 'arn:aws:sso::aws:applicationProvider/custom'
+                  
+                  try:
+                      # Get portal configuration from IDC config
+                      app_start_url = app_config.get('callback_url')
+                      if not app_start_url:
+                          logger.error(f"No callback_url found in SSM parameter for {app_name}")
+                          raise ValueError(f"Missing callback_url in SSM parameter /sso/{app_name}/config")
+                      portal_visibility = app_config.get('portal_visibility', 'ENABLED')
+                      
+                      logger.info(f"Creating IDC application with callback URL: {app_start_url}")
+                      logger.info(f"Portal visibility: {portal_visibility}")
+                      
+                      response = sso_admin.create_application(
+                          InstanceArn=params['instance_arn'],
+                          Name=app_name,
+                          Description=f"Identity Center OIDC Application: {app_name}",
+                          ApplicationProviderArn=provider_arn,
+                          PortalOptions={
+                              'SignInOptions': {
+                                  'Origin': 'APPLICATION',
+                                  'ApplicationUrl': app_start_url
+                              }
+                          },
+                          Status=portal_visibility
+                      )
+                      app_arn = response['ApplicationArn']
+                      logger.info(f"Application created: {app_arn}")
+                      action = 'created'
+                  except ClientError as error:
+                      if error.response['Error']['Code'] == 'ConflictException':
+                          logger.info(f"Application {app_name} already exists, updating configuration")
+                          apps = sso_admin.list_applications(InstanceArn=params['instance_arn'])
+                          app_arn = None
+                          for app in apps['Applications']:
+                              if app['Name'] == app_name:
+                                  app_arn = app['ApplicationArn']
+                                  break
+                          if not app_arn:
+                              raise ValueError(f"Could not find existing application: {app_name}")
+                          action = 'updated'
+                      else:
+                          raise
+                  
+                  # Configure IDC OIDC settings
+                  configure_params = {
+                      'application_arn': app_arn,
+                      'application_name': app_name,
+                      'oidc_config': oidc_config,
+                      'app_config': app_config,
+                      'groups': groups,
+                      'instance_arn': params['instance_arn']
+                  }
+                  configure_oidc_settings(configure_params)
+                  
+                  # Assign groups to IDC application if specified
+                  if groups:
+                      logger.info(f"Assigning {len(groups)} groups to IDC application")
+                      try:
+                          assign_params = {
+                              'instance_arn': params['instance_arn'],
+                              'user_ids': groups,
+                              'application_arn': app_arn
+                          }
+                          assign_users_to_application(assign_params)
+                      except Exception as e:
+                          logger.error(f"Failed to assign groups to IDC application: {str(e)}")
+                  else:
+                      logger.info("No groups specified for IDC application assignment")
+                  
+                  return {
+                      'statusCode': 200, 
+                      'body': json.dumps({
+                          'application_arn': app_arn, 
+                          'action': action, 
+                          'application_name': app_name,
+                          'provider_type': 'identity_center',
+                          'oidc_issuer': oidc_config.get('Issuer'),
+                          'callback_url': app_start_url,
+                          'groups_assigned': len(groups) if groups else 0,
+                          'success': True
+                      })
+                  }
+              except Exception as error:
+                  logger.error(f"Failed to manage application: {str(error)}")
+                  raise
+          
+          def assign_users_to_application(params):
+              try:
+                  # Input validation
+                  if not params:
+                      raise ValueError("Parameters cannot be empty")
+                  
+                  if not params.get('application_arn'):
+                      raise ValueError("Missing required parameter: application_arn")
+                  
+                  if not params.get('instance_arn'):
+                      raise ValueError("Missing required parameter: instance_arn")
+                  
+                  sso_admin = boto3.client('sso-admin')
+                  identitystore = boto3.client('identitystore')
+                  results = []
+                  group_inputs = params.get('user_ids', [])
+                  
+                  try:
+                      instance_response = sso_admin.describe_instance(InstanceArn=params['instance_arn'])
+                      identity_store_id = instance_response['IdentityStoreId']
+                  except Exception as e:
+                      raise ValueError(f"Could not retrieve identity store ID: {str(e)}")
+                  
+                  logger.info(f"Assigning {len(group_inputs)} groups to application")
+                  
+                  for group_input in group_inputs:
+                      try:
+                          group_id = group_input
+                          
+                          if not group_input.startswith('group-'):
+                              response = identitystore.list_groups(
+                                  IdentityStoreId=identity_store_id,
+                                  Filters=[{'AttributePath': 'DisplayName', 'AttributeValue': group_input}]
+                              )
+                              if response['Groups']:
+                                  group_id = response['Groups'][0]['GroupId']
+                                  logger.info(f"Resolved group '{group_input}' to {group_id}")
+                              else:
+                                  logger.warning(f"Group not found: {group_input}")
+                                  results.append({'group': group_input, 'status': 'failed', 'error': 'Group not found'})
+                                  continue
+                          
+                          response = sso_admin.create_application_assignment(
+                              ApplicationArn=params['application_arn'],
+                              PrincipalType='GROUP',
+                              PrincipalId=group_id
+                          )
+                          results.append({'group': group_input, 'group_id': group_id, 'status': 'success'})
+                          logger.debug(f"Group {group_id} assigned to application")
+                      except ClientError as error:
+                          logger.warning(f"Failed to assign group {group_input}: {error.response['Error']['Message']}")
+                          results.append({'group': group_input, 'status': 'failed', 'error': error.response['Error']['Message']})
+                  
+                  return {'statusCode': 200, 'body': json.dumps({'group_assignments': results, 'success': True})}
+              except KeyError as error:
+                  raise ValueError(f"Missing required parameter: {str(error)}")
+          
+          def configure_oidc_settings(params):
+              try:
+                  # Input validation
+                  if not params:
+                      raise ValueError("Parameters cannot be empty")
+                  
+                  app_arn = params.get('application_arn')
+                  if not app_arn:
+                      raise ValueError("Missing required parameter: application_arn")
+                  
+                  sso_admin = boto3.client('sso-admin')
+                  ssm = boto3.client('ssm')
+                  app_type = params.get('app_type', 'oidcapp')
+                  
+                  logger.info(f"Configuring OIDC for application: {app_arn}")
+                  
+                  sso_admin.put_application_assignment_configuration(
+                      ApplicationArn=app_arn,
+                      AssignmentRequired=params.get('assignment_required', True)
+                  )
+                  
+                  try:
+                      config_param = ssm.get_parameter(Name=f'/sso/{app_type}/config', WithDecryption=True)
+                      param_value = config_param['Parameter']['Value'].strip()
+                      
+                      if not param_value:
+                          logger.warning(f"Parameter /sso/{app_type}/config is empty")
+                          config = {}
+                          oidc_config = {}
+                      else:
+                          config = json.loads(param_value)
+                          oidc_config = config.get('oidc', {})
+                          logger.info(f"Successfully loaded OIDC config for {app_type}")
+                      
+                      if oidc_config:
+                          # Store OIDC configuration in DynamoDB for reference
+                          try:
+                              import time
+                              dynamodb = boto3.resource('dynamodb')
+                              table = dynamodb.Table('idc-sso-application-config')
+                              
+                              # Extract app_config for use in this function
+                              app_config = params.get('app_config', config.get('application', {}))
+                              app_name = params.get('application_name', 'unknown')
+                              
+                              # Store SSM parameter metadata
+                              param_metadata = {
+                                  'parameter_name': f'/sso/{app_name}/config',
+                                  'application_name': app_name,
+                                  'application_arn': app_arn,
+                                  'provider_type': 'identity_center',
+                                  'oidc_issuer': oidc_config.get('Issuer'),
+                                  'callback_url': oidc_config.get('callback_url') or app_config.get('callback_url'),
+                                  'portal_visibility': app_config.get('portal_visibility', 'ENABLED'),
+                                  'groups': config.get('groups', []),
+                                  'cross_account_id': config.get('cross_account', {}).get('identity_account_id'),
+                                  'region': config.get('cross_account', {}).get('region'),
+                                  'idc_domain': config.get('cross_account', {}).get('idc_domain'),
+                                  'deployment_status': 'deployed',
+                                  'created_date': str(int(time.time())),
+                                  'last_updated': str(int(time.time())),
+                                  'status': config.get('status', 'production')
+                              }
+                              
+                              # Set TTL for non-production
+                              if config.get('status', 'production').lower() != 'production':
+                                  param_metadata['ttl'] = int(time.time()) + 31536000  # 1 year
+                              
+                              table.put_item(Item=param_metadata)
+                              logger.info(f"SSM parameter metadata stored in DynamoDB for {app_name}")
+                              logger.info(f"Parameter tracked: /sso/{app_name}/config")
+                              
+                          except Exception as e:
+                              logger.warning(f"Failed to store OIDC metadata: {str(e)}")
+                          
+                          # =============================================================================
+                          # TRUSTED IDENTITY PROPAGATION (TIP) CONFIGURATION
+                          # =============================================================================
+                          # NOTE: This section is for ADVANCED use cases only!
+                          # 
+                          # REMOVE THIS ENTIRE SECTION IF:
+                          # - Using standard IDC OIDC authentication (most common use case)
+                          # - Portal-based applications with basic group access
+                          # - No API token validation requirements
+                          # 
+                          # KEEP THIS SECTION IF:
+                          # - Your applications need to validate IDC JWT tokens via API
+                          # - Cross-account service-to-service authentication
+                          # - Custom token validation scenarios
+                          # 
+                          # To remove: Delete from here to "except Exception as e:" line below
+                          # =============================================================================
+                          
+                          # Configure Trusted Identity Propagation if enabled
+                          tip_config = config.get('trusted_identity_propagation', {})
+                          if tip_config.get('enabled'):
+                              try:
+                                  # Auto-create Trusted Token Issuer if not provided
+                                  issuer_arn = tip_config.get('trusted_token_issuer_arn')
+                                  if not issuer_arn and tip_config.get('issuer_url'):
+                                      logger.info("Creating Trusted Token Issuer automatically")
+                                      issuer_params = {
+                                          'issuer_name': tip_config.get('issuer_name', 'IDCOIDCProvider'),
+                                          'issuer_url': tip_config.get('issuer_url'),
+                                          'claim_attribute_path': tip_config.get('claim_attribute_path', 'email'),
+                                          'identity_store_attribute_path': tip_config.get('identity_store_attribute_path', 'emails.value')
+                                      }
+                                      issuer_result = create_trusted_token_issuer(issuer_params)
+                                      if issuer_result.get('statusCode') == 200:
+                                          issuer_body = json.loads(issuer_result['body'])
+                                          issuer_arn = issuer_body.get('trusted_token_issuer_arn')
+                                          logger.info(f"Auto-created Trusted Token Issuer: {issuer_arn}")
+                                  
+                                  if issuer_arn:
+                                      sso_admin.put_application_grant(
+                                          ApplicationArn=app_arn,
+                                          GrantType='urn:ietf:params:oauth:grant-type:jwt-bearer',
+                                          Grant={
+                                              'JwtBearer': {
+                                                  'AuthorizedTokenIssuers': [{
+                                                      'AuthorizedAudiences': [oidc_config.get('ClientId', 'default-audience')],
+                                                      'TrustedTokenIssuerArn': issuer_arn
+                                                  }]
+                                              }
+                                          }
+                                      )
+                                      logger.info("Trusted Identity Propagation configured successfully")
+                                  else:
+                                      logger.warning("TIP enabled but no Trusted Token Issuer ARN available")
+                              except Exception as e:
+                                  logger.warning(f"Failed to configure Trusted Identity Propagation: {str(e)}")
+                          
+                          # Create IAM Role for OIDC Authentication Testing
+                          try:
+                              iam_role_arn = create_oidc_iam_role(oidc_config, app_type)
+                              logger.info(f"Created IAM role for OIDC testing: {iam_role_arn}")
+                          except Exception as e:
+                              logger.warning(f"Failed to create IAM role: {str(e)}")
+                              iam_role_arn = None
+                          
+                          # Application credentials still need manual console configuration
+                          app_credentials_role = os.environ.get('APPLICATION_CREDENTIALS_ROLE_ARN')
+                          if app_credentials_role:
+                              logger.info(f"Application credentials role (manual config required): {app_credentials_role}")
+                          
+                          # Log OIDC application creation success
+                          logger.info(f"OIDC Application created: {app_arn}")
+                          logger.info(f"OIDC configuration completed successfully")
+                          logger.info(f"Client ID: {oidc_config.get('ClientId')}")
+                          logger.info(f"Issuer: {oidc_config.get('Issuer')}")
+                          if tip_config.get('enabled'):
+                              logger.info(f"Trusted Identity Propagation: {'Enabled' if issuer_arn else 'Failed'}")
+                          if iam_role_arn:
+                              logger.info(f"IAM Role for testing: {iam_role_arn}")
+                          if app_credentials_role:
+                              logger.info(f"Application credentials role (manual config required): {app_credentials_role}")
+                          logger.info(f"Application start URL: {app_config.get('callback_url', 'from SSM parameter')} (configured via SSM parameter)")
+                          logger.info(f"Portal visibility: {os.environ.get('PORTAL_VISIBILITY', 'ENABLED')} (configured via API)")
+                          logger.info(f"Application ready for use - Only credentials require manual console configuration")
+                          
+                  except ssm.exceptions.ParameterNotFound:
+                      logger.warning(f'Parameter /sso/{app_type}/config not found')
+                  except json.JSONDecodeError as e:
+                      logger.error(f"Invalid JSON in parameter /sso/{app_type}/config: {str(e)}")
+                      raise ValueError(f"Invalid JSON configuration for {app_type}: {str(e)}")
+                  
+                  # Ensure app_config is defined for return statement
+                  app_config = params.get('app_config', {})
+                  
+                  return {'statusCode': 200, 'body': json.dumps({
+                      'oidc_application_created': True, 
+                      'application_arn': app_arn,
+                      'iam_role_arn': iam_role_arn if 'iam_role_arn' in locals() else None,
+                      'application_credentials_role': os.environ.get('APPLICATION_CREDENTIALS_ROLE_ARN'),
+                      'application_start_url': app_config.get('callback_url', 'configured via SSM parameter'),
+                      'portal_visibility': os.environ.get('PORTAL_VISIBILITY', 'ENABLED'),
+                      'manual_configuration_required': True,
+                      'console_configuration_note': 'Only application credentials require manual console configuration',
+                      'success': True
+                  })}
+              except Exception as error:
+                  logger.error(f"OIDC configuration failed: {str(error)}")
+                  raise
+      Timeout: 60  # 60 seconds timeout for application operations
+
+
+
+  # =============================================================================
+  # SSM PARAMETER STORAGE
+  # =============================================================================
+  # Store the IDC instance ARN for reference by other resources
+  IDCInstanceArnParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub '/sso/idc-instance-arn-${AWS::StackName}'  # Unique parameter name
+      Type: String
+      Value: !Ref InstanceArn                                   # Store instance ARN
+
+  # =============================================================================
+  # EVENTBRIDGE AUTOMATION
+  # =============================================================================
+  # EventBridge service role - allows EventBridge to invoke the Lambda function
+  IDCEventBridgeRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sts:AssumeRole
+      # Allow EventBridge to invoke the Lambda function
+      Policies:
+        - PolicyName: EventBridgeLambdaInvoke
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - lambda:InvokeFunction  # Invoke Lambda function
+                Resource: !GetAtt IDCSSOOperationsFunction.Arn  # Only this function
+
+  # EventBridge rule - triggers Lambda when SSM parameters change
+  # This enables automatic application deployment when configurations are updated
+  IDCParameterChangeRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: 'Automatically deploy IDC OIDC applications when SSM parameters change'
+      # Event pattern - only trigger on specific SSM parameter changes
+      EventPattern:
+        source: ['aws.ssm']                    # Only SSM events
+        detail-type: ['Parameter Store Change'] # Only parameter changes
+        detail:
+          name:
+            - prefix: '/sso/'                   # Parameters starting with /sso/
+            - suffix: '/config'                 # Parameters ending with /config
+          operation: ['Create', 'Update']       # Only create/update operations
+      State: ENABLED  # Rule is active
+      RoleArn: !GetAtt IDCEventBridgeRole.Arn  # Service role for EventBridge
+      # Lambda function target configuration
+      Targets:
+        - Arn: !GetAtt IDCSSOOperationsFunction.Arn  # Target Lambda function
+          Id: 'TriggerIDCOIDCCreation'                # Unique target ID
+          # Transform EventBridge event into Lambda input
+          InputTransformer:
+            # Extract values from the EventBridge event
+            InputPathsMap:
+              parameterName: '$.detail.name'        # SSM parameter name
+              operation: '$.detail.operation'       # Create/Update operation
+              region: '$.detail.region'             # AWS region
+            # Create Lambda input JSON
+            InputTemplate: |
+              {
+                "operation": "manage_application",     
+                "parameters": {
+                  "parameter_name": "<parameterName>",
+                  "trigger_source": "ssm_parameter_change",
+                  "change_operation": "<operation>",
+                  "region": "<region>",
+                  "provider_type": "identity_center"
+                }
+              }
+
+  # Lambda permission - allows EventBridge to invoke the function
+  IDCEventBridgeInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref IDCSSOOperationsFunction        # Lambda function name
+      Action: lambda:InvokeFunction                      # Permission to invoke
+      Principal: events.amazonaws.com                    # EventBridge service
+      SourceArn: !GetAtt IDCParameterChangeRule.Arn     # Only this EventBridge rule
+
+  # =============================================================================
+  # DYNAMODB TABLE
+  # =============================================================================
+  # This table tracks IDC application configurations and deployment status.
+  # It provides visibility into which applications have been created and their settings.
+  IDCSSOConfigTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: idc-sso-application-config  # Table name
+      BillingMode: PAY_PER_REQUEST           # Pay per request (no capacity planning)
+      # Table attributes (only key attributes need to be defined)
+      AttributeDefinitions:
+        - AttributeName: parameter_name      # Primary key: SSM parameter name
+          AttributeType: S                   # String type
+        - AttributeName: application_name    # GSI key: Application name
+          AttributeType: S                   # String type
+      # Primary key configuration
+      KeySchema:
+        - AttributeName: parameter_name      # Partition key
+          KeyType: HASH
+      # Global Secondary Index for querying by application name
+      GlobalSecondaryIndexes:
+        - IndexName: application-name-index   # Index name
+          KeySchema:
+            - AttributeName: application_name  # Index partition key
+              KeyType: HASH
+          Projection:
+            ProjectionType: ALL                # Include all attributes in index
+      # Enable point-in-time recovery for data protection
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      # Enable TTL for automatic cleanup of non-production records
+      TimeToLiveSpecification:
+        AttributeName: ttl                   # TTL attribute name
+        Enabled: true                        # TTL enabled
+
+# =============================================================================
+# OUTPUTS
+# =============================================================================
+# These outputs provide important ARNs and information for integration
+# with other templates and manual configuration steps.
+
+Outputs:
+  # Lambda function ARN for manual invocation or integration
+  IDCLambdaFunctionArn:
+    Description: ARN of the IDC Lambda function for manual invocation
+    Value: !GetAtt IDCSSOOperationsFunction.Arn
+  
+  # DynamoDB table name for monitoring and querying
+  IDCConfigTableName:
+    Description: DynamoDB table name for tracking application configurations
+    Value: !Ref IDCSSOConfigTable
+  
+  # Cross-account role ARN - needed for Identity Center account setup
+  IDCCrossAccountRoleArn:
+    Description: |
+      Cross-account role ARN for IDC integration.
+      Use this ARN when deploying the companion template in the Identity Center account.
+    Value: !GetAtt IDCSSMCrossAccountRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-IDCCrossAccountRoleArn'
+  
+  # Cross-account role name for reference
+  IDCCrossAccountRoleName:
+    Description: Cross-account role name for IDC integration
+    Value: !Ref IDCSSMCrossAccountRole
+    Export:
+      Name: !Sub '${AWS::StackName}-IDCCrossAccountRoleName'
+  
+  # Information about dynamically created IAM resources
+  IDCDynamicRoleCreation:
+    Description: |
+      IAM roles and OIDC providers are created automatically by the Lambda function.
+      Each OIDC application gets its own IAM role for testing purposes.
+    Value: 'IAM roles created automatically with format: IDCOIDC-{app-type}-Role'
+  
+  # Identity account ID for reference
+  IdentityAccountId:
+    Description: AWS Account ID where Identity Center is deployed
+    Value: !Ref IdentityAccountId
+    Export:
+      Name: !Sub '${AWS::StackName}-IdentityAccountId'
+  
+  # Setup instructions for completing the cross-account integration
+  IDCSetupInstructions:
+    Description: Next steps to complete the IDC cross-account setup
+    Value: !Sub |
+      🚀 NEXT STEPS FOR CROSS-ACCOUNT SETUP:
+      
+      1. Deploy the companion template in Identity Center account (${IdentityAccountId})
+      2. Use this cross-account role ARN: ${IDCSSMCrossAccountRole.Arn}
+      3. Ensure ExternalId 'idc-sso-integration' is configured correctly
+      4. Create SSM parameters in Identity Center account with OIDC configurations
+      5. Verify automatic application creation works via EventBridge triggers
+      6. Check Lambda logs for dynamically created IAM role ARNs
+      7. Configure application credentials manually in Identity Center console
+      
+      📋 PARAMETER FORMAT:
+      Create parameters like: /sso/{app-name}/config
+      With JSON containing: oidc, application, and groups configuration
+      
+      🔍 MONITORING:
+      - Check DynamoDB table: ${IDCSSOConfigTable}
+      - Review Lambda logs: /aws/lambda/idc-sso-operations-handler
+      - Verify EventBridge rule triggers: ${IDCParameterChangeRule}
 
