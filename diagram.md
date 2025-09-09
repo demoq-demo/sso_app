@@ -45,7 +45,7 @@ graph TB
         direction TB
         
         subgraph "📝 Configuration Storage"
-            SSM[📋 SSM Parameter Store<br/>/sso/{app-name}/config<br/>🔒 SecureString]:::ssm
+            SSM[📋 SSM Parameter Store<br/>/sso/app-name/config<br/>🔒 SecureString]:::ssm
         end
         
         subgraph "🔔 Event Processing"
@@ -61,7 +61,7 @@ graph TB
         
         subgraph "🛡️ IAM Resources"
             IAM_OIDC[🔗 OIDC Identity Provider<br/>d-abc123def456.awsapps.com]:::iam
-            IAM_ROLE[🛡️ IAM Role<br/>IDCOIDC-{app-type}-Role<br/>🧪 Testing Purpose]:::iam
+            IAM_ROLE[🛡️ IAM Role<br/>IDCOIDC-app-type-Role<br/>🧪 Testing Purpose]:::iam
         end
         
         subgraph "📊 Tracking"
