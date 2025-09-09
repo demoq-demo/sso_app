@@ -85,9 +85,7 @@ graph TB
     LAMBDA2 -->|🛡️ Create| IAM_ROLE
     LAMBDA2 -->|📊 Track| DDB2
     
-    %% Account boundaries
-    class "🏢 Application Account (Part 1)" account
-    class "🏛️ Identity Center Account (Part 2)" account
+
 ```
 
 ## Sequence Diagram - End-to-End Flow
